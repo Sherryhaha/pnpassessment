@@ -1175,10 +1175,13 @@ namespace PnP.Scanning.Core.Storage
             // of Management Activity API). Requires AuditLogsQuery-SharePoint.Read.All app permission.
             string graphBaseUrl = Authentication.CloudManager.GetMicrosoftGraphAuthority(m365env);
             string[] auditScopes = new[] { $"https://{graphBaseUrl}/.default" };
-            string bearerToken;
+
+            // Fetch a token up front purely to validate auth/permission early — a token failure here
+            // (missing consent, bad cert, etc.) short-circuits into the "skipped/TokenError" path before
+            // we start submitting queries.
             try
             {
-                bearerToken = await authManager.GetAccessTokenAsync(auditScopes);
+                await authManager.GetAccessTokenAsync(auditScopes);
             }
             catch (Exception ex)
             {
@@ -1191,6 +1194,12 @@ namespace PnP.Scanning.Core.Storage
                 return;
             }
 
+            // Provide a token *factory* (not a captured string) to the analyzer: a long audit scan can
+            // outlive the initial token's ~1h lifetime while Graph queues/processes queries, so records
+            // fetched at the end would 401 on a stale token. GetAccessTokenAsync is cache-backed, so calling
+            // it per request is cheap while the token is valid and transparently refreshes it near expiry.
+            Func<CancellationToken, Task<string>> tokenProvider = _ => authManager.GetAccessTokenAsync(auditScopes);
+
             // Pass site URLs as objectIdFilters only when --siteslist / --sitesfile was explicitly
             // used. For full-tenant scans, pass null so the query covers the whole tenant.
             var scanRecord = dbContext.Scans.FirstOrDefault(p => p.ScanId == scanId);
@@ -1202,31 +1211,68 @@ namespace PnP.Scanning.Core.Storage
 
             Action<string> auditProgress = msg => Log.Information("[AuditLog] {ScanId} {AuditMsg}", scanId, msg);
             var (allStats, skipReason) = await Scanners.AuditLogUsageAnalyzer.QueryAllSitesAuditUsageAsync(
-                Authentication.AuthenticationManager.HttpClient, graphBaseUrl, bearerToken,
+                Authentication.AuthenticationManager.HttpClient, graphBaseUrl, tokenProvider,
                 siteUrlsForFilter, windowStart, windowEnd, cancellationToken, auditProgress);
 
-            // allStats != null + skipReason == null  → full success
-            // allStats != null + skipReason != null  → partial success (some chunks failed, data may be incomplete)
-            // allStats == null                       → complete failure or skip
+            // allStats != null + skipReason == null → full success
+            // allStats != null + skipReason != null → partial success (some chunks failed, data incomplete)
+            // allStats == null                      → complete failure (any skipReason here is a real error:
+            //                                         NoPermission / SubmitError / PollError / RecordsError /
+            //                                         ParseError / QueryFailed / QueryTimeout / Error / ChunkError).
+            // Benign skips (e.g. SovereignCloud, token-acquisition failure) never reach this branch — they call
+            // BuildAuditLogRecords directly with status "skipped". So any failure that DOES reach here is a real
+            // error → "failed" (this is the fix for the original bug where missing-permission was mislabeled
+            // "skipped"). The skipReason string is written to the CSV SkipReason column so an operator sees why.
             string globalStatus = allStats != null
                 ? (skipReason == null ? "succeeded" : "partial")
-                : (skipReason != null && (skipReason.StartsWith("Error") || skipReason.StartsWith("SubmitError")
-                    || skipReason.StartsWith("PollError") || skipReason.StartsWith("RecordsError")
-                    || skipReason.StartsWith("QueryFailed") || skipReason.StartsWith("QueryTimeout"))
-                    ? "failed" : "skipped");
+                : (skipReason != null ? "failed" : "skipped");
 
             // Collect all records across all sites into one list, then bulk-insert in one shot.
             // This avoids EF tracking 100k+ entities individually before SaveChanges.
+            //
+            // Longest-prefix assignment: sort sites by descending URL length so that a sub-site
+            // (/sites/foo/sub) wins over its parent (/sites/foo), and the root SC
+            // (https://tenant.sharepoint.com) never swallows every page in the tenant.
+            // Each page URL is assigned to exactly one site (the most-specific prefix match).
+            //
+            // Bucket in a SINGLE pass over the pages, directly into per-site stats dictionaries, so the
+            // total cost is O(pages × sites) for the prefix match but only O(pages) dictionary inserts —
+            // avoiding a second O(sites × pages) scan (one full Where/ToDictionary over every page, per
+            // site) that would dominate a full-tenant scan (100k pages × 10k sites).
+            var sortedSiteUrls = siteUrls.OrderByDescending(s => s.Length).ToList();
+            // Pre-compute the "<site>/" prefixes once instead of re-allocating (s + "/") per page × site.
+            var sitePrefixes = sortedSiteUrls.Select(s => s + "/").ToList();
+
+            Dictionary<string, Dictionary<string, Scanners.AuditLogUsageAnalyzer.AuditPageStats>> statsBySite = null;
+            if (allStats != null)
+            {
+                statsBySite = new Dictionary<string, Dictionary<string, Scanners.AuditLogUsageAnalyzer.AuditPageStats>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kvp in allStats)
+                {
+                    string owningSite = null;
+                    for (int i = 0; i < sitePrefixes.Count; i++)
+                    {
+                        if (kvp.Key.StartsWith(sitePrefixes[i], StringComparison.OrdinalIgnoreCase))
+                        {
+                            owningSite = sortedSiteUrls[i];
+                            break;
+                        }
+                    }
+                    if (owningSite == null)
+                        continue; // page under no scanned site — same exclusion as before
+
+                    if (!statsBySite.TryGetValue(owningSite, out var siteDict))
+                        statsBySite[owningSite] = siteDict = new Dictionary<string, Scanners.AuditLogUsageAnalyzer.AuditPageStats>(StringComparer.OrdinalIgnoreCase);
+                    siteDict[kvp.Key] = kvp.Value;
+                }
+            }
+
             var allRecords = new List<ClassicPageAuditUsage>();
             foreach (var siteUrl in siteUrls)
             {
                 IReadOnlyDictionary<string, Scanners.AuditLogUsageAnalyzer.AuditPageStats> siteStats = null;
-                if (allStats != null)
-                {
-                    siteStats = allStats
-                        .Where(kvp => kvp.Key.StartsWith(siteUrl + "/", StringComparison.OrdinalIgnoreCase))
-                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.OrdinalIgnoreCase);
-                }
+                if (statsBySite != null && statsBySite.TryGetValue(siteUrl, out var assigned) && assigned.Count > 0)
+                    siteStats = assigned;
                 BuildAuditLogRecords(allRecords, scanId, siteUrl, siteStats, windowStart, windowEnd, globalStatus, skipReason);
             }
 
@@ -1243,6 +1289,20 @@ namespace PnP.Scanning.Core.Storage
             string queryStatus,
             string skipReason)
         {
+            // Strip scheme+host so stored PageUrl is server-relative (matches classicpages.csv Url column).
+            // ApplyAuditUsage looks up record.PageUrl in the stats dict (absolute keys), so we convert after.
+            string tenantOrigin = null;
+            try { tenantOrigin = new Uri(siteUrl).GetLeftPart(UriPartial.Authority); }
+            catch { }
+            string Rel(string abs)
+            {
+                if (tenantOrigin == null || !abs.StartsWith(tenantOrigin, StringComparison.OrdinalIgnoreCase))
+                    return abs;
+                var rel = abs.Substring(tenantOrigin.Length);
+                // Root site collection (host only, no path) strips to ""; normalize to "/".
+                return rel.Length == 0 ? "/" : rel;
+            }
+
             if (stats == null || stats.Count == 0)
             {
                 target.Add(new ClassicPageAuditUsage
@@ -1250,7 +1310,7 @@ namespace PnP.Scanning.Core.Storage
                     ScanId = scanId,
                     SiteUrl = siteUrl,
                     WebUrl = "/",
-                    PageUrl = siteUrl,
+                    PageUrl = Rel(siteUrl),
                     AuditViewsCount = 0,
                     AuditCreatesCount = 0,
                     AuditEditsCount = 0,
@@ -1273,13 +1333,16 @@ namespace PnP.Scanning.Core.Storage
                         PageUrl = kvp.Key,
                         AuditWindowStart = windowStart,
                         AuditWindowEnd = windowEnd,
-                        // Per-page rows always show "succeeded" — the page's own data came from a
-                        // succeeded chunk. Window-level coverage gaps (partial) are reported on the
-                        // site-level placeholder row only, keeping per-page data rows clean.
-                        QueryStatus = "succeeded",
-                        SkipReason = null,
+                        // Reflect the real coverage on every page row. On "partial", one or more chunk
+                        // sub-windows failed, so THIS page's counts are a floor (some days are missing) and
+                        // a page whose activity fell entirely in a failed chunk may be absent altogether.
+                        // Stamping "succeeded" here would misrepresent incomplete counts as authoritative;
+                        // propagate queryStatus/skipReason so a consumer can tell complete from partial data.
+                        QueryStatus = queryStatus,
+                        SkipReason = queryStatus == "partial" ? skipReason : null,
                     };
                     Scanners.AuditLogUsageAnalyzer.ApplyAuditUsage(record, stats);
+                    record.PageUrl = Rel(kvp.Key);
                     target.Add(record);
                 }
 
@@ -1292,7 +1355,7 @@ namespace PnP.Scanning.Core.Storage
                         ScanId = scanId,
                         SiteUrl = siteUrl,
                         WebUrl = "/",
-                        PageUrl = siteUrl,
+                        PageUrl = Rel(siteUrl),
                         AuditWindowStart = windowStart,
                         AuditWindowEnd = windowEnd,
                         QueryStatus = queryStatus,

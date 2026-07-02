@@ -1,4 +1,4 @@
-using FluentAssertions;
+﻿using FluentAssertions;
 using PnP.Scanning.Core.Scanners;
 using PnP.Scanning.Core.Storage;
 using System.Collections.Generic;
@@ -138,13 +138,13 @@ namespace PnP.Scanning.Core.Tests.Scanners.Pages
         [Fact]
         public void MergeChunks_SeparatePages_CombinesAllEntries()
         {
-            var chunk1 = new Dictionary<string, AuditLogUsageAnalyzer.AuditPageStats>(StringComparer.OrdinalIgnoreCase)
+            var chunk1 = new Dictionary<string, AuditLogUsageAnalyzer.ChunkPageData>(StringComparer.OrdinalIgnoreCase)
             {
-                ["https://contoso.sharepoint.com/sites/s/SitePages/A.aspx"] = new(3, 1, 0, 2),
+                ["https://contoso.sharepoint.com/sites/s/SitePages/A.aspx"] = new(3, 1, 0, new HashSet<int> { 1, 2 }),
             };
-            var chunk2 = new Dictionary<string, AuditLogUsageAnalyzer.AuditPageStats>(StringComparer.OrdinalIgnoreCase)
+            var chunk2 = new Dictionary<string, AuditLogUsageAnalyzer.ChunkPageData>(StringComparer.OrdinalIgnoreCase)
             {
-                ["https://contoso.sharepoint.com/sites/s/SitePages/B.aspx"] = new(5, 0, 2, 3),
+                ["https://contoso.sharepoint.com/sites/s/SitePages/B.aspx"] = new(5, 0, 2, new HashSet<int> { 1, 2, 3 }),
             };
 
             var merged = AuditLogUsageAnalyzer.MergeChunks(new[] { chunk1, chunk2 });
@@ -158,10 +158,11 @@ namespace PnP.Scanning.Core.Tests.Scanners.Pages
         public void MergeChunks_SamePage_SumsCountsAcrossChunks()
         {
             const string url = "https://contoso.sharepoint.com/sites/s/SitePages/Home.aspx";
-            var chunk1 = new Dictionary<string, AuditLogUsageAnalyzer.AuditPageStats>(StringComparer.OrdinalIgnoreCase)
-                { [url] = new(3, 1, 0, 2) };
-            var chunk2 = new Dictionary<string, AuditLogUsageAnalyzer.AuditPageStats>(StringComparer.OrdinalIgnoreCase)
-                { [url] = new(2, 0, 1, 1) };
+            // Users 1 and 2 appear in chunk1; user 1 also appears in chunk2 (cross-chunk dedup case)
+            var chunk1 = new Dictionary<string, AuditLogUsageAnalyzer.ChunkPageData>(StringComparer.OrdinalIgnoreCase)
+                { [url] = new(3, 1, 0, new HashSet<int> { 1, 2 }) };
+            var chunk2 = new Dictionary<string, AuditLogUsageAnalyzer.ChunkPageData>(StringComparer.OrdinalIgnoreCase)
+                { [url] = new(2, 0, 1, new HashSet<int> { 1 }) };
 
             var merged = AuditLogUsageAnalyzer.MergeChunks(new[] { chunk1, chunk2 });
 
@@ -169,16 +170,39 @@ namespace PnP.Scanning.Core.Tests.Scanners.Pages
             merged[url].ViewsCount.Should().Be(5);   // 3 + 2
             merged[url].CreatesCount.Should().Be(1); // 1 + 0
             merged[url].EditsCount.Should().Be(1);   // 0 + 1
-            merged[url].UniqueUsers.Should().Be(3);  // 2 + 1 (intentional over-count across chunks)
+            merged[url].UniqueUsers.Should().Be(2);  // union({1,2}, {1}) = {1,2} — cross-chunk dedup
         }
 
         [Fact]
         public void MergeChunks_EmptyInput_ReturnsEmptyDict()
         {
             var merged = AuditLogUsageAnalyzer.MergeChunks(
-                Enumerable.Empty<IReadOnlyDictionary<string, AuditLogUsageAnalyzer.AuditPageStats>>());
+                Enumerable.Empty<IReadOnlyDictionary<string, AuditLogUsageAnalyzer.ChunkPageData>>());
 
             merged.Should().BeEmpty();
+        }
+
+        [Fact]
+        public void MergeChunks_UnionExceedingCap_IsBoundedToMaxTrackedUsersPerPage()
+        {
+            // A hot page appearing in multiple chunks, each contributing distinct users, must not let
+            // the merged distinct-user set grow past the per-page cap (MaxTrackedUsersPerPage = 10,000).
+            const string url = "https://contoso.sharepoint.com/sites/s/SitePages/Hot.aspx";
+            const int cap = 10_000;
+
+            // chunk1: users 0..7999, chunk2: users 8000..15999 — 16,000 distinct hashes total across chunks.
+            var users1 = new HashSet<int>(Enumerable.Range(0, 8_000));
+            var users2 = new HashSet<int>(Enumerable.Range(8_000, 8_000));
+            var chunk1 = new Dictionary<string, AuditLogUsageAnalyzer.ChunkPageData>(StringComparer.OrdinalIgnoreCase)
+                { [url] = new(8_000, 0, 0, users1) };
+            var chunk2 = new Dictionary<string, AuditLogUsageAnalyzer.ChunkPageData>(StringComparer.OrdinalIgnoreCase)
+                { [url] = new(8_000, 0, 0, users2) };
+
+            var merged = AuditLogUsageAnalyzer.MergeChunks(new[] { chunk1, chunk2 });
+
+            // Counts still sum; the distinct-user set is capped rather than reaching 16,000.
+            merged[url].ViewsCount.Should().Be(16_000);
+            merged[url].UniqueUsers.Should().Be(cap);
         }
     }
 }

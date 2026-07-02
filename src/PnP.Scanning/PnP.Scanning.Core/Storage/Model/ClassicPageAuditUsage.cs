@@ -1,4 +1,4 @@
-namespace PnP.Scanning.Core.Storage
+﻿namespace PnP.Scanning.Core.Storage
 {
     internal class ClassicPageAuditUsage : BaseScanResult
     {
