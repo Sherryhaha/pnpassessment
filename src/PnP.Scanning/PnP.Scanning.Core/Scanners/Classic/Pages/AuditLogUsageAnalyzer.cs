@@ -48,7 +48,7 @@ namespace PnP.Scanning.Core.Scanners
         private static readonly HashSet<string> EditOperations = new(StringComparer.OrdinalIgnoreCase)
             { "ClassicPageEdited" };
 
-        private static readonly TimeSpan PollInterval   = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan PollInterval   = TimeSpan.FromSeconds(60);
         // Graph audit queries are async and can sit in "notStarted" for a long time on a busy tenant
         // before Graph even begins processing. Observed queue waits of ~50-60 min end-to-end, so a
         // shorter timeout makes an otherwise-healthy query fail. 90 min gives Graph room to drain its
@@ -142,6 +142,14 @@ namespace PnP.Scanning.Core.Scanners
             var succeeded = chunkResults.Where(r => r.Stats != null).Select(r => r.Stats).ToList();
             var failures  = chunkResults.Where(r => r.Stats == null).Select(r => r.SkipReason).ToList();
 
+            // One-line terminal roll-up of every chunk's outcome. When some chunks time out while others
+            // succeed, the individual timeout lines are scattered ~90 min apart in the log; this collects
+            // the final tally in one place so an operator immediately sees "N succeeded, M failed" and the
+            // reason for each failure, rather than reconstructing it from hundreds of interleaved lines.
+            if (failures.Count > 0)
+                progress?.Invoke($"Audit chunk outcomes: {succeeded.Count}/{total} succeeded, {failures.Count}/{total} failed — " +
+                                 string.Join(" | ", failures));
+
             if (succeeded.Count == 0)
             {
                 // All chunks failed (or window was empty). Surface the FIRST failure's reason so the
@@ -153,6 +161,12 @@ namespace PnP.Scanning.Core.Scanners
 
             var merged = MergeChunks(succeeded);
 
+            // Total attributed events across all pages (views + creates + edits). Reported alongside the
+            // page count so the log answers both "how many pages had activity" and "how much activity" —
+            // a chunk that returns thousands of records collapsing to a handful of pages (or vice-versa)
+            // is then visible without opening the CSV.
+            long totalEvents = merged.Values.Aggregate(0L, (sum, s) => sum + s.ViewsCount + s.CreatesCount + s.EditsCount);
+
             if (failures.Count > 0)
             {
                 // Partial success: return the merged stats AND a non-null skipReason so the caller marks
@@ -160,11 +174,11 @@ namespace PnP.Scanning.Core.Scanners
                 // The reason enumerates every distinct chunk failure so an operator can see what was missed.
                 string partialReason = $"PartialData: {failures.Count}/{total} chunk(s) failed — {string.Join("; ", failures.Distinct())}";
                 progress?.Invoke($"WARNING: {partialReason}");
-                progress?.Invoke($"Audit log collection partial: {merged.Count} pages with events across {succeeded.Count}/{total} chunks");
+                progress?.Invoke($"Audit log collection partial: {merged.Count} page(s), {totalEvents} event(s) across {succeeded.Count}/{total} chunks");
                 return (merged, partialReason);
             }
 
-            progress?.Invoke($"Audit log collection done: {merged.Count} pages with events across {succeeded.Count}/{total} chunks");
+            progress?.Invoke($"Audit log collection done: {merged.Count} page(s), {totalEvents} event(s) across {succeeded.Count}/{total} chunks");
             return (merged, null);
         }
 
@@ -286,6 +300,20 @@ namespace PnP.Scanning.Core.Scanners
             // looks like a hang. We log the query id once on submit, then log every status transition
             // (plus a periodic heartbeat) so the operator can tell "waiting on Graph" from "stuck".
             progress?.Invoke($"[{chunkLabel}] submitted query {queryId}, polling for completion (timeout {QueryTimeout.TotalMinutes:0} min)");
+            // Echo the exact filters that were sent. A query that returns 0 records because a filter is
+            // subtly wrong (bad objectId prefix, wrong operation name, dropped recordType) is otherwise
+            // indistinguishable from "the tenant genuinely had no activity" — this line makes the query
+            // definition auditable straight from the log without re-deriving it from the source.
+            {
+                string objectScope = (siteUrls != null && siteUrls.Count > 0)
+                    ? string.Join(", ", siteUrls.Select(u => u.TrimEnd('/') + "/*"))
+                    : "(none — whole tenant)";
+                progress?.Invoke($"[{chunkLabel}] query {queryId} filters: " +
+                                 $"window {chunkStart:yyyy-MM-ddTHH:mm:ssZ}→{chunkEnd:yyyy-MM-ddTHH:mm:ssZ}; " +
+                                 $"recordTypes=[sharePoint]; " +
+                                 $"operations=[ClassicPageViewed, ClassicPageCreated, ClassicPageEdited]; " +
+                                 $"objectIdFilters=[{objectScope}]");
+            }
             var pollStart = DateTime.UtcNow;
             var deadline = pollStart.Add(QueryTimeout);
             string lastStatus = null;
@@ -314,8 +342,8 @@ namespace PnP.Scanning.Core.Scanners
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex) { return (null, $"PollError: {ex.Message}"); }
 
-                // Read the body then dispose the response immediately — this loop can run for hundreds
-                // of polls (10s interval, up to 45 min) per chunk, so leaking one response per poll adds up.
+                // Read the body then dispose the response immediately — this loop can run for dozens of
+                // polls (PollInterval apart, up to QueryTimeout) per chunk, so leaking one response per poll adds up.
                 string status;
                 using (pollResponse)
                 {
@@ -361,6 +389,15 @@ namespace PnP.Scanning.Core.Scanners
             var results = new Dictionary<string, (int Views, int Creates, int Edits, HashSet<int> Users)>(StringComparer.OrdinalIgnoreCase);
             string nextLink = $"{queriesUrl}/{queryId}/records?$top={PageSize}";
 
+            // Record-fetch can page through many @odata.nextLink hops after a query succeeds. Without
+            // logging here, a scan that "succeeded" then stalls (a slow/hung nextLink page, a 401 on a
+            // late page) looks identical to a finished chunk — the last log line was 'succeeded' and then
+            // silence. Track page/record counts so the fetch phase is visible and its throughput auditable.
+            int recordsFetched = 0;
+            int recordPages = 0;
+            var fetchStart = DateTime.UtcNow;
+            progress?.Invoke($"[{chunkLabel}] query {queryId} succeeded — fetching records");
+
             while (nextLink != null)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -375,7 +412,7 @@ namespace PnP.Scanning.Core.Scanners
                     }, tokenProvider, cancellationToken);
                 }
                 catch (OperationCanceledException) { throw; }
-                catch (Exception ex) { return (null, $"RecordsError: {ex.Message}"); }
+                catch (Exception ex) { return (null, $"RecordsError after {recordsFetched} records ({recordPages} pages): {ex.Message}"); }
 
                 string recordsBody;
                 // Dispose the records response as soon as its body is read — a page of 5000 records can
@@ -385,7 +422,7 @@ namespace PnP.Scanning.Core.Scanners
                     if (!recordsResponse.IsSuccessStatusCode)
                     {
                         var errBody = await recordsResponse.Content.ReadAsStringAsync(cancellationToken);
-                        return (null, $"RecordsError: HTTP {(int)recordsResponse.StatusCode}: {errBody[..Math.Min(200, errBody.Length)]}");
+                        return (null, $"RecordsError after {recordsFetched} records ({recordPages} pages): HTTP {(int)recordsResponse.StatusCode}: {errBody[..Math.Min(200, errBody.Length)]}");
                     }
 
                     recordsBody = await recordsResponse.Content.ReadAsStringAsync(cancellationToken);
@@ -393,15 +430,17 @@ namespace PnP.Scanning.Core.Scanners
 
                 JsonDocument recordsDoc;
                 try { recordsDoc = JsonDocument.Parse(recordsBody); }
-                catch (JsonException ex) { return (null, $"ParseError fetching records for query {queryId}: {ex.Message}"); }
+                catch (JsonException ex) { return (null, $"ParseError fetching records for query {queryId} after {recordsFetched} records ({recordPages} pages): {ex.Message}"); }
 
                 using (recordsDoc)
                 {
                 if (!recordsDoc.RootElement.TryGetProperty("value", out var valueElement))
                     return (null, $"ParseError: records response for query {queryId} missing 'value' array");
 
+                int pageRecordCount = 0;
                 foreach (var record in valueElement.EnumerateArray())
                 {
+                    pageRecordCount++;
                     if (!record.TryGetProperty("operation", out var opProp)) continue;
                     string operation = opProp.GetString() ?? string.Empty;
 
@@ -426,10 +465,22 @@ namespace PnP.Scanning.Core.Scanners
                         existing.Users.Add(StringComparer.OrdinalIgnoreCase.GetHashCode(userId));
                 }
 
+                recordPages++;
+                recordsFetched += pageRecordCount;
+
                 nextLink = recordsDoc.RootElement.TryGetProperty("@odata.nextLink", out var nextLinkProp)
                     ? nextLinkProp.GetString() : null;
+
+                // Log a per-page line only while there is more to fetch (nextLink != null), so a
+                // single-page chunk stays quiet and only the rollup below reports it. For multi-page
+                // fetches this makes forward progress visible instead of silence between pages.
+                if (nextLink != null)
+                    progress?.Invoke($"[{chunkLabel}] query {queryId} fetching records: {recordsFetched} so far ({recordPages} pages)");
                 } // end using (recordsDoc)
             }
+
+            progress?.Invoke($"[{chunkLabel}] query {queryId} fetched {recordsFetched} record(s) in {recordPages} page(s) " +
+                             $"over {(DateTime.UtcNow - fetchStart).TotalSeconds:0}s → {results.Count} distinct page(s)");
 
             var output = new Dictionary<string, ChunkPageData>(StringComparer.OrdinalIgnoreCase);
             foreach (var kvp in results)
