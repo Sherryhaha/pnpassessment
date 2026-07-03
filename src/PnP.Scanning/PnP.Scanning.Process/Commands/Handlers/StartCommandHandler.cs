@@ -350,13 +350,12 @@ namespace PnP.Scanning.Process.Commands
                 name: $"--{name}",
                 parseArgument: (result) =>
                 {
-                    var mode = result.FindResultFor(modeOption);
-                    if (mode != null && mode.GetValueOrDefault<Mode>() != Mode.Classic)
-                    {
-                        result.ErrorMessage = $"--{name} can only be used with --{Constants.StartMode} classic";
-                        return false;
-                    }
-
+                    // NOTE: the "--flag only valid with --mode classic" check is done in a command-level
+                    // validator (see Create()), NOT here. Reading another option's value from inside a
+                    // parseArgument callback is unreliable — the target option may not be parsed yet, so
+                    // GetValueOrDefault<Mode>() can return the enum default instead of the supplied value
+                    // (System.CommandLine dotnet/command-line-api#1287), which mislabeled a valid
+                    // "--mode Classic ... --skipusageinformation" invocation as an error.
                     if (result.Tokens.Count == 0)
                     {
                         // Switch style: "--flag" with no value means true.
@@ -385,13 +384,8 @@ namespace PnP.Scanning.Process.Commands
                 name: $"--{name}",
                 parseArgument: (result) =>
                 {
-                    var mode = result.FindResultFor(modeOption);
-                    if (mode != null && mode.GetValueOrDefault<Mode>() != Mode.Classic)
-                    {
-                        result.ErrorMessage = $"--{name} can only be used with --{Constants.StartMode} classic";
-                        return defaultValue;
-                    }
-
+                    // The "--flag only valid with --mode classic" check is done in a command-level
+                    // validator (see Create()), not here — see the note in CreateClassicFlagOption.
                     if (result.Tokens.Count == 0)
                     {
                         return defaultValue;
@@ -425,6 +419,36 @@ namespace PnP.Scanning.Process.Commands
         /// <returns></returns>
         public Command Create()
         {
+            // Cross-option validation runs here (after ALL options are parsed) rather than inside an
+            // individual option's parseArgument, where the referenced option may not be parsed yet
+            // (System.CommandLine dotnet/command-line-api#1287). This makes the --mode value reliable,
+            // so "--mode Classic ... --skipusageinformation" is no longer mis-rejected regardless of
+            // argument order.
+            cmd.AddValidator(result =>
+            {
+                var classicOnlyOptions = new Option[]
+                {
+                    classicExportWebPartPropertiesOption,
+                    classicSkipUsageInformationOption,
+                    classicSkipUserInformationOption,
+                    classicHomePageOnlyOption,
+                    classicAuditLogWindowDaysOption,
+                };
+                var modeResult = result.FindResultFor(modeOption);
+                var mode = modeResult?.GetValueOrDefault<Mode>() ?? Mode.Classic;
+                if (mode == Mode.Classic)
+                    return;
+                foreach (var opt in classicOnlyOptions)
+                {
+                    // Only complain about options the user actually supplied on the command line.
+                    if (result.FindResultFor(opt) is { IsImplicit: false })
+                    {
+                        result.ErrorMessage = $"--{opt.Name} can only be used with --{Constants.StartMode} classic";
+                        return;
+                    }
+                }
+            });
+
             // Binder approach as that one can handle an unlimited number of command line arguments
             var startBinder = new StartBinder(modeOption, tenantOption, sitesListOption, sitesFileOption,
                                               authenticationModeOption, applicationIdOption, tenantIdOption, certPathOption, certPfxFileInfoOption, certPfxFilePasswordOption, threadsOption
